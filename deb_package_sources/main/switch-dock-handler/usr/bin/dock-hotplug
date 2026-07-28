@@ -1,6 +1,28 @@
 #!/bin/bash
 
+exec >> /tmp/dock-hotplug 2>&1
+
+SAVED_EDID=/run/dock-edid-hash
+SAVED_MODES=/var/dock-hotplug/
+
+hash_edid() {
+  # taken from autorandr
+  xrandr -q --verbose | awk '
+    /^[^ ]+ (dis)?connected / { DEV=$1; }
+    $1 ~ /^[a-f0-9]+$/ { ID[DEV] = ID[DEV] $1 }
+    END { printf "%s", ID["DP-0"]; }' | md5sum | awk '{print $1}'
+}
+
+get_refresh_rate() {
+  # https://ferd.ca/awk-in-20-minutes.html
+  xrandr -q | gawk '
+    /^[^ ]+ (dis)?connected / { DEV=$1; }
+    DEV == "DP-0" && match($0, /   [^ ]+.* ([0-9.]+)\*/, m) { print m[1] }'
+}
+
 dock_hotplug_handle() {
+  # set -o xtrace
+  echo "($$) { dock_hotplug_handle($1)" | logger
   # Set DISPLAY needed for everything.
   if [ -e "/tmp/.X11-unix/X1" ]; then export DISPLAY=":1"; else export DISPLAY=":0"; fi
 
@@ -24,21 +46,52 @@ dock_hotplug_handle() {
   export DSI_SETTINGS="--primary --auto"
   export XAUTHORITY=$(ps -C Xorg -f --no-header | sed -n 's/.*-auth //; s/ -[^ ].*//; p')
 
+  mkdir -p SAVED_MODES
+
+  if [[ "$1" -eq 1 ]]; then
+    # Record EDID when connected.
+    edid_hash=$(hash_edid)
+    echo "$edid_hash" > $SAVED_EDID
+
+    # Restore mode when connected.
+    read -r saved_res saved_rate < "$SAVED_MODES/$edid_hash" 2>/dev/null
+  else
+    # Save mode when disconnected.
+    if read -r edid_hash < $SAVED_EDID 2>/dev/null; then
+      read -r saved_res saved_rate < "$SAVED_MODES/$edid_hash" 2>/dev/null
+      curr_res="$(xrandr -q | sed -E -n '/DP-0/s/.* ([0-9]+x[0-9]+)\+.*/\1/p')"
+      curr_rate="$(get_refresh_rate)"
+      if [[ -n $curr_res && -n $curr_rate && "$curr_res $curr_rate" -ne "$saved_res $saved_rate" ]]; then
+        echo "$curr_res $curr_rate" > "$SAVED_MODES/$edid_hash"
+      fi
+    fi
+    rm -f $SAVED_EDID
+  fi
+
   # Set DP output vars.
   if [[ "$1" -eq 1 ]]; then
     # Read custom WIDTHxHEIGHT from dock-hotplug.conf.
     if [ -e "/etc/dock-hotplug.conf" ]; then
-      export DP_SETTINGS=$(cat /etc/dock-hotplug.conf)
-    fi
-    # No custom res, set max.
-    if [ "$DP_SETTINGS" == "" ]; then
-      DP_SETTINGS=$(xrandr -q | sed -E -n '/DP-0/s/.* ([0-9]+x[0-9]+)\+.*/\1/p')
-    fi
-    # If res found set it, otherwise auto. It's impossible to reach auto, but just in case.
-    if [ "$DP_SETTINGS" == "" ]; then
-      export DP_SETTINGS="--primary --auto"
+      read -r res rate < /etc/dock-hotplug.conf 2>/dev/null
+      # Unconditionally set user-specified mode.
+      DP_SETTINGS="--primary --mode $res --panning ${res}+0+0 --pos 0x0 --fb $res"
+      if [[ -n $rate ]]; then
+        DP_SETTINGS+=" --rate $rate"
+      fi
+    # No custom res. Check if monitor is enabled, only set mode if not.
+    elif [[ -n "$(xrandr -q | sed -E -n '/DP-0/s/.* ([0-9]+x[0-9]+)\+.*/\1/p')" ]]; then
+      # If already enabled, don't touch the user's settings.
+      echo "($$) dock_hotplug_handle: monitor enabled" | logger
+      DP_SETTINGS="--primary --pos 0x0"
+
+    elif [[ -n $saved_res && -n $saved_rate ]]; then
+      # If disabled (and no resolution present), attempt to restore saved resolution.
+      echo "($$) dock_hotplug_handle: monitor disabled, restoring backup" | logger
+      DP_SETTINGS="--primary --mode $saved_res --rate $saved_rate --pos 0x0"
     else
-      export DP_SETTINGS="--primary --mode "$DP_SETTINGS" --panning "$DP_SETTINGS"+0+0 --pos 0x0 --fb "$DP_SETTINGS""
+      # If no saved resolution, use auto.
+      echo "($$) dock_hotplug_handle: monitor disabled, resetting resolution" | logger
+      DP_SETTINGS="--primary --auto --pos 0x0"
     fi
   fi
 
@@ -75,6 +128,8 @@ dock_hotplug_handle() {
       sudo -u "$DH_USER_NAME" XDG_RUNTIME_DIR="$DH_XDG_RUNTIME_DIR" wpctl set-default $(sudo -u "$DH_USER_NAME" XDG_RUNTIME_DIR="$DH_XDG_RUNTIME_DIR" wpctl status | grep "Built-in Audio Speaker playback + Headphones playback" | grep "\d+" -Po | head -n 1)
     fi
   fi
+
+  echo "($$) } dock_hotplug_handle" | logger
 
   # Set default scaling and enable always showing cursor.
   if [[ "$1" -eq 0 ]]; then
